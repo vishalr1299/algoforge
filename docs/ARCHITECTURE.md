@@ -1,0 +1,1 @@
+# Architecture\n\nMarket data -> strategy evaluation -> order intent -> risk checks -> execution adapter -> order/fill events -> portfolio ledger. Strategy code must never hold broker credentials or call broker SDKs directly. Colab is for development; persistent services will later run on secured infrastructure.\n
