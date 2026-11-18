@@ -1,0 +1,1 @@
+# AlgoForge\n\nExtensible algorithmic trading research and paper-execution platform for Indian markets.\n\n**V0.1:** foundation only; live order placement is disabled.\n\nPersonal-first; future SaaS subject to broker, exchange, data-licensing and regulatory review.\n\nColab is for development and backtesting, not always-on execution.\n
