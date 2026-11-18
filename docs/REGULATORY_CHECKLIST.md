@@ -1,0 +1,1 @@
+# Regulatory checklist\n\nBefore live trading or public launch, review current SEBI circulars, NSE/BSE implementation standards, Zerodha Kite Connect terms, authentication/static-IP/order-tagging requirements, registration obligations and market-data licensing. This is not legal advice. Keep live execution disabled until requirements are verified.\n
