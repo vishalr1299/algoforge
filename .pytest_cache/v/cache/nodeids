@@ -1,0 +1,4 @@
+[
+  "tests/test_paper_broker.py::test_paper_order_is_simulated",
+  "tests/test_paper_broker.py::test_zero_quantity_is_rejected"
+]
