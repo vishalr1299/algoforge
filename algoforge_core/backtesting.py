@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from algoforge_core.strategy import Strategy, StrategySignal
+from algoforge_core.risk import RiskManager
 
 
 @dataclass(frozen=True)
@@ -31,13 +32,17 @@ class BacktestResult:
 
 
 class BacktestEngine:
+
     def __init__(
-    self,
-    initial_capital: float = 100000,
-    quantity: int = 1,
-    brokerage_per_order: float = 0,
-    slippage_bps: float = 0,
-):
+        self,
+        initial_capital: float = 100000,
+        quantity: int = 1,
+        brokerage_per_order: float = 0,
+        slippage_bps: float = 0,
+        risk_manager: RiskManager | None = None,
+        use_dynamic_sizing: bool = False,
+        lot_size: int = 1,
+    ):
         if initial_capital <= 0:
             raise ValueError("Initial capital must be positive")
 
@@ -50,10 +55,17 @@ class BacktestEngine:
         if slippage_bps < 0:
             raise ValueError("Slippage cannot be negative")
 
+        if lot_size <= 0:
+            raise ValueError("Lot size must be positive")
+
         self.initial_capital = float(initial_capital)
         self.quantity = int(quantity)
         self.brokerage_per_order = float(brokerage_per_order)
         self.slippage_bps = float(slippage_bps)
+
+        self.risk_manager = risk_manager or RiskManager()
+        self.use_dynamic_sizing = bool(use_dynamic_sizing)
+        self.lot_size = int(lot_size)
 
     def _execution_price(self, price: float, action: str) -> float:
         slippage = self.slippage_bps / 10000
@@ -70,7 +82,6 @@ class BacktestEngine:
 
         required = {"open", "high", "low", "close", "volume"}
 
-        # 1. Validate input
         if not isinstance(candles, pd.DataFrame):
             raise TypeError("Candles must be a DataFrame")
 
@@ -101,17 +112,16 @@ class BacktestEngine:
         if candles[list(required)].isna().any().any():
             raise ValueError("Candle data cannot contain missing values")
 
-        # 2. Initialize state
         trades = []
         position = None
-        pending_action = None
+        pending_signal = None
 
         cash_equity = self.initial_capital
         equity_values = []
 
         instrument = getattr(strategy, "instrument", "UNKNOWN")
 
-        # 3. Close-position helper
+        # Close an existing position.
         def close_position(timestamp, reference_price):
             nonlocal position, cash_equity
 
@@ -131,7 +141,7 @@ class BacktestEngine:
 
             gross_pnl = (
                 (exit_price - position["entry_price"])
-                * self.quantity
+                * position["quantity"]
                 * direction
             )
 
@@ -145,7 +155,7 @@ class BacktestEngine:
                 Trade(
                     instrument=instrument,
                     side=position["side"],
-                    quantity=self.quantity,
+                    quantity=position["quantity"],
                     entry_time=position["entry_time"],
                     exit_time=timestamp,
                     entry_price=position["entry_price"],
@@ -158,50 +168,154 @@ class BacktestEngine:
 
             position = None
 
-        # 4. Open-position helper
-        def open_position(timestamp, reference_price, action):
+        # Open a position using fixed or dynamically calculated quantity.
+        def open_position(timestamp, reference_price, signal):
             nonlocal position, cash_equity
+
+            action = signal.action
 
             entry_price = self._execution_price(
                 float(reference_price),
                 action,
             )
 
+            stop_loss = getattr(signal, "stop_loss", None)
+            target = getattr(signal, "target", None)
+
+            if stop_loss is not None:
+                self.risk_manager.validate_trade_levels(
+                    side=action,
+                    entry_price=entry_price,
+                    stop_loss_price=float(stop_loss),
+                    target_price=(
+                        float(target) if target is not None else None
+                    ),
+                )
+
+            elif target is not None:
+                target = float(target)
+
+                if target <= 0:
+                    raise ValueError("Target price must be positive")
+
+                if action == "BUY" and target <= entry_price:
+                    raise ValueError("BUY target must be above entry")
+
+                if action == "SELL" and target >= entry_price:
+                    raise ValueError("SELL target must be below entry")
+
+            if self.use_dynamic_sizing:
+
+                if stop_loss is None:
+                    raise ValueError(
+                        "Dynamic sizing requires a stop-loss price"
+                    )
+
+                trade_quantity = self.risk_manager.calculate_quantity(
+                    capital=cash_equity,
+                    entry_price=entry_price,
+                    stop_loss_price=float(stop_loss),
+                    side=action,
+                    lot_size=self.lot_size,
+                )
+
+            else:
+                trade_quantity = self.quantity
+
             entry_fee = self.brokerage_per_order
             cash_equity -= entry_fee
 
             position = {
                 "side": action,
+                "quantity": trade_quantity,
                 "entry_time": timestamp,
                 "entry_price": entry_price,
                 "entry_fee": entry_fee,
+                "stop_loss": (
+                    float(stop_loss) if stop_loss is not None else None
+                ),
+                "target": (
+                    float(target) if target is not None else None
+                ),
             }
 
-        # 5. Process candles
+        # Check intrabar stop-loss and target levels.
+        def check_exit_levels(timestamp, row):
+            if position is None:
+                return
+
+            side = position["side"]
+            stop = position["stop_loss"]
+            target = position["target"]
+
+            open_price = float(row["open"])
+            high_price = float(row["high"])
+            low_price = float(row["low"])
+
+            # Stop-loss has priority if both levels are touched.
+            if side == "BUY" and stop is not None:
+
+                if open_price <= stop:
+                    close_position(timestamp, open_price)
+                    return
+
+                if low_price <= stop:
+                    close_position(timestamp, stop)
+                    return
+
+            elif side == "SELL" and stop is not None:
+
+                if open_price >= stop:
+                    close_position(timestamp, open_price)
+                    return
+
+                if high_price >= stop:
+                    close_position(timestamp, stop)
+                    return
+
+            # Target execution uses the target price conservatively.
+            if side == "BUY" and target is not None:
+
+                if high_price >= target:
+                    close_position(timestamp, target)
+                    return
+
+            elif side == "SELL" and target is not None:
+
+                if low_price <= target:
+                    close_position(timestamp, target)
+                    return
+
+        # Process historical candles.
         for timestamp, row in candles.iterrows():
 
-            # Execute the previous candle's signal at this candle's open.
-            if pending_action in {"BUY", "SELL"}:
+            # Execute the previous candle's signal at the current open.
+            if pending_signal is not None:
 
-                # Close the existing position if the signal is opposite.
-                if position is not None:
-                    if pending_action != position["side"]:
-                        close_position(timestamp, row["open"])
+                action = pending_signal.action
 
-                # Open the new position if we are flat.
-                if position is None:
-                    open_position(
-                        timestamp,
-                        row["open"],
-                        pending_action,
-                    )
+                if action in {"BUY", "SELL"}:
 
-            elif pending_action == "EXIT" and position is not None:
-                close_position(timestamp, row["open"])
+                    if position is not None:
+                        if action != position["side"]:
+                            close_position(timestamp, row["open"])
 
-            pending_action = None
+                    if position is None:
+                        open_position(
+                            timestamp,
+                            row["open"],
+                            pending_signal,
+                        )
 
-            # Generate signal using only the current candle.
+                elif action == "EXIT" and position is not None:
+                    close_position(timestamp, row["open"])
+
+            pending_signal = None
+
+            # Check stop-loss and target on the current candle.
+            check_exit_levels(timestamp, row)
+
+            # Generate a new signal using the current candle.
             signal = strategy.on_candle(row.to_dict())
 
             if not isinstance(signal, StrategySignal):
@@ -210,23 +324,20 @@ class BacktestEngine:
             if signal.action not in {"BUY", "SELL", "EXIT", "HOLD"}:
                 raise ValueError("Invalid strategy action")
 
-            # Schedule action for the next candle.
             if signal.action == "EXIT":
 
                 if position is not None:
-                    pending_action = "EXIT"
+                    pending_signal = signal
 
             elif signal.action in {"BUY", "SELL"}:
 
                 if position is None:
-                    pending_action = signal.action
+                    pending_signal = signal
 
                 elif signal.action != position["side"]:
-                    # IMPORTANT: Preserve the opposite signal.
-                    # The next candle will close and reverse the position.
-                    pending_action = signal.action
+                    pending_signal = signal
 
-            # Mark open position to market, including estimated exit costs.
+            # Mark open positions to market.
             unrealized_pnl = 0.0
 
             if position is not None:
@@ -237,7 +348,7 @@ class BacktestEngine:
 
                 estimated_exit_price = self._execution_price(
                     float(row["close"]),
-                    exit_action
+                    exit_action,
                 )
 
                 direction = (
@@ -246,7 +357,7 @@ class BacktestEngine:
 
                 unrealized_pnl = (
                     (estimated_exit_price - position["entry_price"])
-                    * self.quantity
+                    * position["quantity"]
                     * direction
                 )
 
@@ -255,7 +366,7 @@ class BacktestEngine:
             current_equity = cash_equity + unrealized_pnl
             equity_values.append(current_equity)
 
-        # 6. Liquidate any remaining position at the final candle close.
+        # Liquidate any remaining position at the final candle close.
         if position is not None:
 
             close_position(
@@ -265,7 +376,6 @@ class BacktestEngine:
 
             equity_values[-1] = cash_equity
 
-        # 7. Build equity curve.
         equity_curve = pd.Series(
             equity_values,
             index=candles.index,
@@ -275,7 +385,6 @@ class BacktestEngine:
         final_capital = cash_equity
         total_pnl = final_capital - self.initial_capital
 
-        # 8. Calculate win rate.
         wins = sum(1 for trade in trades if trade.net_pnl > 0)
 
         win_rate = (
@@ -284,7 +393,6 @@ class BacktestEngine:
             else 0.0
         )
 
-        # 9. Calculate maximum drawdown, including initial capital.
         equity_with_initial = pd.concat(
             [
                 pd.Series([self.initial_capital]),
@@ -306,7 +414,6 @@ class BacktestEngine:
             else 0.0
         )
 
-        # 10. Return results.
         return BacktestResult(
             trades=trades,
             initial_capital=self.initial_capital,
